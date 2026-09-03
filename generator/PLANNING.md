@@ -1,179 +1,701 @@
-# Brief-to-Video Generator — Planning & System Design
+# Brief2Motion — Planning & System Design
 
-## 1. What I understood the problem to be
+## 1. Problem Understanding
 
-The deliverable is not "call an LLM, get HTML, render it." It's a system that
-can **certify its own output** against an objective, external gate
-(`hyperframes check`) and **repair itself** when it fails — without a human
-in the loop, deterministically, and with a bounded number of attempts before
-it refuses to ship.
+The goal of Brief2Motion is to build an automated motion-graphics video generator using HyperFrames.
 
-Three things are being graded that a naive pipeline would miss:
+A user provides a short plain-language brief such as:
 
-- **A real plan artifact.** The structured plan from gpt-5.5 has to be
-  something a human can read and audit, not a prompt buried in a chain.
-- **A verification loop with teeth.** It's not enough to run `check` once —
-  the system has to read the *specific* issues, act on them, re-run the
-  gate, and know when to give up.
-- **Honest failure.** A generator that ships a broken video because it ran
-  out of patience is explicitly called out as worse than one that refuses.
-  That means the exit code / final report has to distinguish "succeeded,"
-  "succeeded after N repairs," and "failed after cap — here is exactly why."
+> "A 12 second ad for a developer tool, dark theme, purple accent, three feature callouts, ends on a call to action."
 
-## 2. System design
+The system should transform that brief into a rendered MP4 without requiring a human to manually edit the composition.
 
-### Components
+The important part of the problem is not simply generating HTML. The system must reason about the brief, create an explicit production plan, generate a HyperFrames composition from that plan, generate any required imagery, verify the generated composition using HyperFrames' validation gate, repair problems when possible, and only report success when the final artifact has been successfully produced and verified.
 
-```
-brief (string)
-   │
-   ▼
-[1] Planner            gpt-5.5 → structured plan (JSON) + plan.md (human-readable)
-   │
-   ▼
-[2] Composition Builder  plan → HyperFrames HTML, using fixed scene blueprints
-   │                     (no freeform LLM-authored HTML — see §3)
-   ▼
-[3] Asset Generator     gpt-image-2 → PNG assets for scenes that need imagery
-   │                     composited into <img> tags referenced by the HTML
-   ▼
-[4] Render              `npx hyperframes render` → MP4
-   │
-   ▼
-[5] Verify              `npx hyperframes check . --json` → {ok, issues[]}
-   │
-   ├─ ok: true  ──────────────────────────────► done, package outputs
-   │
-   └─ ok: false
-        │
-        ▼
-   [6] Repair            classify each issue → rule-based fix if known type,
-        │                 else targeted LLM patch of just the affected element
-        │                 (not the whole file)
-        │
-        └─► back to [4], up to REPAIR_CAP attempts (default 3)
-              │
-              └─ cap hit ──► fail loudly: write failure-report.json with the
-                              full issue history across attempts, non-zero exit
+The intended pipeline is:
+
+```text
+Plain-language brief
+        ↓
+GPT-5.5 planning
+        ↓
+Structured plan artifact
+        ↓
+Composition generation
+        ↓
+GPT-image-2 assets
+        ↓
+HyperFrames HTML/CSS/GSAP composition
+        ↓
+HyperFrames check gate
+        ↓
+Repair if required
+        ↓
+HyperFrames render
+        ↓
+MP4
 ```
 
-### Data that moves between stages, and where it can break
+The design deliberately separates planning from composition generation. This makes the model's decisions inspectable and gives the system a stable intermediate representation that can be validated before code is generated.
 
-| Stage | Input | Output | Failure mode | Handling |
-|---|---|---|---|---|
-| Planner | brief text | `plan.json` (schema-validated) | gpt-5.5 returns prose instead of JSON, or a plan that's internally inconsistent (scene durations don't sum to total, text too long for stated duration) | Strict JSON-schema validation (pydantic). On failure, re-prompt once with the validator's error message appended verbatim. Cap at 2 attempts, then abort with a clear "planner could not produce a valid plan" error — this is the *model returning something unusable* case named in the brief. |
-| Builder | `plan.json` | `index.html` + sub-compositions | Plan references a scene type the builder has no blueprint for | Builder validates plan against the **enum of blueprints it actually supports** before building anything. This check happens at planning time too — the planner's system prompt is given the exact blueprint list and constrained to it, so this should be rare, but the builder re-checks because prompts are not contracts. |
-| Asset Generator | image briefs from plan | PNG files | gpt-image-2 times out, errors, or returns unusable bytes | Retry with backoff (2 attempts, 180s client timeout per the brief's guidance). On final failure, fall back to a deterministic solid-panel background (brand color, no image) rather than blocking the whole render — documented as a degraded-but-shippable state, logged in the final report. |
-| Render | HTML + assets | MP4 | `hyperframes render` throws (missing FFmpeg, bad path, JS runtime error in composition) | Run `hyperframes lint` *before* `render` as a cheap static pre-check — catches structural mistakes (missing `data-duration`, malformed `class="clip"`) without spending a render cycle. |
-| Verify | rendered composition | `{ok, issues[]}` | `check` itself errors out (not the same as `ok:false`) | Treated as an infrastructure failure, not a repairable issue — logged separately, does not consume a repair attempt. |
-| Repair | issues[] | patched HTML | Issue type not in the known rule set | Falls through to LLM patch mode, scoped to only the offending element's outerHTML plus the issue text — smaller surface area than "rewrite everything," which both keeps repairs cheap and keeps failures legible when they don't converge. |
+---
 
-### Determinism
+# 2. Goals
 
-- Any pseudo-randomness needed for layout variation (e.g. staggered
-  entrance delays across feature callouts) is seeded from a hash of the
-  brief text via a small seeded PRNG (`mulberry32`), never `Math.random()`
-  directly in generated compositions — this mirrors the constraint the
-  framework itself enforces for its own examples.
-- gpt-5.5 is called with `temperature: 0` for the planning step specifically
-  because "the same brief run twice must produce the same video" is a hard
-  constraint, and plan-level nondeterminism is the likeliest source of
-  drift. (Model-level determinism isn't fully guaranteed by any provider,
-  so the plan is cached by a hash of the brief — the *second* run of an
-  identical brief reuses the cached plan rather than re-calling the model
-  at all. This is belt-and-suspenders, and I say so rather than claiming
-  perfect determinism I can't back up.)
+### Primary goals
 
-## 3. Choices made, and what I rejected
+1. Accept a plain-language video brief.
+2. Convert the brief into a structured production plan using GPT-5.5.
+3. Persist the plan as a real artifact rather than keeping it hidden inside a prompt.
+4. Generate a HyperFrames composition from the plan.
+5. Generate required visual assets using gpt-image-2.
+6. Run the HyperFrames verification gate on every generated composition.
+7. Interpret validation failures and attempt bounded repairs.
+8. Refuse to report success when verification or rendering fails.
+9. Make repeated runs deterministic.
+10. Support different durations, scene counts, text density and aspect ratios.
 
-**Rejected: letting gpt-5.5 author the HyperFrames HTML/GSAP directly.**
-This is the obvious approach and I expect most submissions will try it. I'm
-not, because it directly undermines the thing being graded hardest — the
-repair loop. If the LLM free-writes the whole composition, a `check` failure
-means asking the same unreliable process to patch code it may not
-"remember" the structure of, with no guarantee the fix doesn't break
-something else. Repairs would be a second full generation, not a targeted
-fix, and two generations of the same unreliable process is not more
-reliable than one.
+### Secondary goals
 
-Instead, gpt-5.5's output is constrained to a plan (scene list, timing,
-copy, motion intent, image briefs) validated against a small fixed set of
-scene blueprints I author and control. This trades creative range (the
-video can only look like compositions of five or six known scene types)
-for a system where verification failures are patchable by adjusting known
-parameters — font size, color, duration, layout offset — rather than
-regenerating unknown code. Given the grading weight on the verify/repair
-loop (25 pts) vs. raw creative range (not scored directly), this is the
-right trade for 48 hours.
+* Keep the architecture small enough to understand and debug quickly.
+* Make failures observable through persisted artifacts and reports.
+* Keep model-generated content constrained by a schema rather than allowing arbitrary model output to directly control the renderer.
 
-**Rejected: async/parallel scene rendering.** HyperFrames renders a
-composition as a whole; there's no per-scene render step to parallelize
-without added complexity for no scored benefit. Sequential pipeline, kept
-simple.
+---
 
-**Rejected: a queueing/retry framework (e.g. Celery, BullMQ).** This is a
-single-shot CLI tool, not a service. A plain bounded `for` loop with a
-cap is the correct amount of infrastructure; anything more is scope
-gold-plating that doesn't move any of the five graded criteria.
+# 3. System Design
 
-**Orchestration language: Python**, shelling out to the `hyperframes` CLI
-via `subprocess`, using the `openai` SDK pointed at the provided gateway for
-both chat and image endpoints. I considered a pure Node pipeline (since
-HyperFrames is npm-native) but the orchestration logic — plan validation,
-repair classification, retry bookkeeping — is not framework-specific, and
-subprocess calls to `npx hyperframes ...` are equally clean from either
-language. Python lets me move faster given it's my stronger stack, and the
-only thing that must be Node is HyperFrames itself, which runs as an
-external process either way.
+The implementation is organized into the following components.
 
-## 4. Handling the model returning something wrong
+```text
+cli.py
+  │
+  ▼
+pipeline.py
+  │
+  ├── planner.py
+  │      └── GPT-5.5
+  │
+  ├── schema.py
+  │
+  ├── seed.py
+  │
+  ├── assets.py
+  │      └── gpt-image-2
+  │
+  ├── builder.py
+  │      └── HyperFrames composition
+  │
+  ├── checker.py
+  │      └── HyperFrames check/render
+  │
+  └── repair.py
+         └── GPT-assisted repair
+```
 
-Three distinct "wrong" cases, handled differently on purpose:
+## Components
 
-1. **Planner returns unusable JSON** (malformed, missing fields, violates
-   schema) → validate immediately, re-prompt once with the exact validator
-   error, cap at 2 tries total, then abort before any code is generated.
-   Cheapest possible failure — nothing downstream has run yet.
-2. **Planner returns a *valid but bad* plan** (e.g. total scene duration
-   doesn't match the requested video length, or references an image brief
-   with no scene to place it in) → caught by a semantic validation pass
-   separate from schema validation (schema-valid JSON can still be a bad
-   plan). Same re-prompt-once-then-abort policy.
-3. **Composition fails the `check` gate** → this is the expected, designed-
-   for case, handled by the repair loop in §2, capped at `REPAIR_CAP`
-   (default 3) full render→check cycles. On cap-out, the system does not
-   return a video — it returns a `failure-report.json` with the brief, the
-   full plan, and the issues from every attempt, and exits non-zero. A
-   human can hand that report back in as a bug report.
+### `cli.py`
 
-## 5. What I will not have time to build, and why the cut is correct
+The command-line entry point.
 
-- **No audio, voiceover, or music.** Nothing in the requirements asks for
-  it, and HyperFrames' audio track model (mixing, ducking, sync) is a
-  meaningful chunk of additional surface area to get right and verify.
-  Cutting it keeps the repair loop's scope to what's actually graded
-  (visual/motion/contrast checks), not audio QA that isn't part of the
-  gate.
-- **No web UI.** The task describes a system that takes a brief and
-  produces a video — a CLI satisfies that contract exactly, and the two
-  demo videos (walkthrough + live test) don't need a UI to be compelling.
-  A UI is pure surface area with zero grading return.
-- **No cloud/Lambda rendering.** Local rendering is sufficient for three
-  briefs in 48 hours; distributed rendering solves a scaling problem I
-  don't have.
-- **No arbitrary scene-type extensibility beyond the blueprint set built
-  for the three demo briefs.** I'm building enough blueprints to cover a
-  vertical/short brief, a widescreen/ad-style brief, and a text-heavy
-  brief — not a general-purpose template authoring system. Building a
-  "blueprint plugin architecture" would be solving a problem I don't have
-  evidence I need, at the cost of hours I don't have to spare.
-- **No caching/reuse of generated images across unrelated runs.** Only the
-  identical-brief-twice case is cached (needed for the determinism
-  requirement). General asset caching is a nice-to-have that doesn't
-  affect grading and risks stale-asset bugs I won't have time to test
-  properly.
+It accepts either a direct brief or a brief file:
 
-Each of these is cut because it spends hours on something outside the five
-graded criteria, at the expense of the thing that's worth the most points:
-a repair loop that's actually robust across three genuinely different
-briefs.
+```bash
+python cli.py "A 12 second ad..."
+```
+
+or:
+
+```bash
+python cli.py --brief-file briefs/dev-tool-ad.txt
+```
+
+It also exposes configuration such as:
+
+* output directory
+* plan cache directory
+* repair attempt cap
+* model name
+
+The CLI is intentionally thin. Business logic is kept inside the `src` package.
+
+---
+
+## `planner.py`
+
+Responsible for turning natural language into a structured video plan.
+
+GPT-5.5 is used for planning rather than directly generating the final HTML.
+
+The planner determines information such as:
+
+* duration
+* aspect ratio
+* scene count
+* scene timing
+* scene purpose
+* text content
+* visual direction
+* motion intent
+* asset requirements
+* transition intent
+* CTA information
+
+The resulting plan is stored as:
+
+```text
+plan.json
+```
+
+This makes the model's reasoning output a concrete artifact that can be inspected independently of the generated composition.
+
+---
+
+## `schema.py`
+
+Defines the expected structure of the generated plan.
+
+The schema acts as a boundary between the language model and the deterministic parts of the system.
+
+Instead of allowing arbitrary model output to directly become HTML, the pipeline first validates and normalizes the plan.
+
+This reduces the chance that an unusable model response reaches the composition generator.
+
+---
+
+## `builder.py`
+
+Converts the structured plan into a HyperFrames composition.
+
+The builder is responsible for:
+
+* HTML structure
+* CSS styling
+* scene layout
+* text placement
+* animation definitions
+* GSAP timelines
+* image placement
+* composition metadata
+* timing
+
+The builder should remain deterministic for a given plan.
+
+The important architectural choice is:
+
+```text
+Model → Plan → Builder
+```
+
+rather than:
+
+```text
+Model → arbitrary HTML
+```
+
+This makes the system easier to validate and repair.
+
+---
+
+## `assets.py`
+
+Handles visual asset generation.
+
+When a plan requires generated imagery, the system calls gpt-image-2 through the provided OpenAI-compatible gateway.
+
+The image response is returned as base64 data.
+
+The pipeline decodes the response and writes the image bytes to the project asset directory.
+
+Generated assets are then referenced by the HyperFrames composition.
+
+The system also has a degraded path for cases where an image request cannot be completed, allowing a composition to fall back to a deterministic non-image visual treatment where appropriate.
+
+---
+
+## `checker.py`
+
+This is one of the most important components.
+
+The assignment explicitly requires:
+
+```bash
+npx hyperframes check . --json
+```
+
+to be executed against every generated composition.
+
+The checker invokes the HyperFrames gate and parses its JSON result.
+
+The HyperFrames gate covers multiple categories including:
+
+* lint
+* runtime validation
+* layout inspection
+* motion checks
+* contrast/accessibility checks
+
+The pipeline treats the returned `ok` value as authoritative.
+
+A composition is not considered verified unless:
+
+```json
+{
+  "ok": true
+}
+```
+
+is returned.
+
+---
+
+# 4. Verification and Repair Loop
+
+The core reliability mechanism is the bounded verification/repair loop.
+
+The intended control flow is:
+
+```text
+Generate composition
+        ↓
+Run HyperFrames check
+        ↓
+       PASS?
+      /     \
+    yes      no
+    ↓        ↓
+ render    inspect issues
+             ↓
+          repair
+             ↓
+       regenerate/check
+             ↓
+       attempt limit?
+```
+
+The system never silently ignores validation failures.
+
+For every attempt, the result is recorded.
+
+If the check fails:
+
+1. Parse the returned JSON.
+2. Extract the issues.
+3. Pass the relevant issue information to the repair logic.
+4. Modify/regenerate the composition.
+5. Run the HyperFrames check again.
+6. Stop after the configured repair cap.
+
+The default repair cap is three attempts.
+
+If all attempts fail, the pipeline reports failure rather than returning an unverified video.
+
+This is important because an automated generator should fail closed rather than claim success on an invalid composition.
+
+---
+
+# 5. Handling Bad Model Output
+
+A model will sometimes return an unusable response.
+
+The system therefore assumes failure is possible at every model boundary.
+
+## Planning failures
+
+Possible problems include:
+
+* invalid JSON
+* missing fields
+* incorrect duration
+* impossible scene timing
+* unsupported aspect ratio
+* empty scene list
+* excessive text
+* malformed structure
+
+The schema validation layer catches structural problems before composition generation.
+
+The planner can also reject unusable responses rather than passing them downstream.
+
+---
+
+## Image-generation failures
+
+Possible problems include:
+
+* API errors
+* timeout
+* malformed response
+* missing image data
+* unusable generated asset
+
+The asset layer handles the response explicitly.
+
+Where appropriate, the composition can use a deterministic fallback visual rather than allowing a missing asset to produce a broken HTML reference.
+
+---
+
+## Composition failures
+
+Even when the plan is valid, generated composition code can fail HyperFrames validation.
+
+Examples include:
+
+* elements outside the frame
+* runtime JavaScript errors
+* poor contrast
+* layout collisions
+* problematic motion
+* unsupported or missing assets
+
+These are handled through the HyperFrames check/repair loop.
+
+---
+
+# 6. Determinism
+
+The requirement states that running the same brief twice should produce the same video.
+
+The system therefore avoids uncontrolled randomness.
+
+A stable hash of the brief is used as the basis for output/cache identity.
+
+Planning results are cached using this identity.
+
+Random-looking composition decisions should use a deterministic seed rather than an uncontrolled random generator.
+
+This provides reproducibility for:
+
+```text
+same brief
+    ↓
+same plan
+    ↓
+same composition decisions
+    ↓
+same asset decisions where deterministic caching applies
+```
+
+Determinism is particularly important for debugging because a failure should be reproducible.
+
+---
+
+# 7. Aspect Ratio Handling
+
+The system does not assume a single video format.
+
+The briefs used during development were intentionally different:
+
+### Brief 1
+
+12-second developer-tool advertisement.
+
+Characteristics:
+
+* dark theme
+* purple accent
+* three feature callouts
+* CTA ending
+
+### Brief 2
+
+9-second vertical meditation-app teaser.
+
+Characteristics:
+
+* vertical format
+* calm/minimal visual direction
+* warm tones
+* sunrise hero image
+* very little text
+* app-name ending
+
+### Brief 3
+
+20-second widescreen technology-conference recap.
+
+Characteristics:
+
+* widescreen format
+* energetic visual direction
+* red/black palette
+* opening title
+* five talk callouts
+* closing image panel
+* registration CTA
+
+The purpose of these briefs is to test whether the pipeline can respond to different structure rather than simply swapping words inside the same template.
+
+---
+
+# 8. Failure Modes
+
+The major failure boundaries identified during design are:
+
+| Failure                 | Detection           | Response                       |
+| ----------------------- | ------------------- | ------------------------------ |
+| Missing API key         | CLI startup         | Fail immediately               |
+| Invalid plan            | Schema validation   | Reject/regenerate              |
+| Image API failure       | Asset layer         | Retry/fallback where possible  |
+| Invalid composition     | HyperFrames check   | Repair                         |
+| Runtime browser failure | HyperFrames check   | Fail/repair                    |
+| Layout issue            | HyperFrames check   | Repair                         |
+| Contrast issue          | HyperFrames check   | Repair                         |
+| Render failure          | Render wrapper      | Fail with report               |
+| Missing MP4             | Artifact validation | Fail rather than claim success |
+| Repair cap reached      | Pipeline            | Fail loudly                    |
+
+---
+
+# 9. Choices and Rejected Alternatives
+
+## Choice: Explicit structured planning
+
+I chose to make the plan a first-class artifact.
+
+### Why
+
+The assignment specifically evaluates how the system thinks before generating code.
+
+A persisted plan also makes debugging easier because I can compare:
+
+```text
+brief → plan → composition
+```
+
+instead of trying to understand a large generated HTML file directly.
+
+### Rejected alternative
+
+Having GPT-5.5 directly generate the final HTML from the brief.
+
+This is faster to prototype but makes the system harder to reason about and repair.
+
+---
+
+## Choice: Deterministic builder
+
+The composition builder is deterministic given the plan.
+
+### Why
+
+This separates creative planning from mechanical rendering and makes failures reproducible.
+
+### Rejected alternative
+
+Allowing the model to rewrite arbitrary HTML until it "looks right."
+
+That creates an uncontrolled loop and makes it difficult to determine why a change happened.
+
+---
+
+## Choice: HyperFrames as the verification authority
+
+I use the provided HyperFrames gate rather than implementing a separate custom validator.
+
+### Why
+
+The assignment explicitly defines the gate as the required quality boundary.
+
+It also combines multiple validation categories in one interface.
+
+### Rejected alternative
+
+Only checking that an MP4 file exists.
+
+A file existing does not prove that the composition is valid.
+
+---
+
+## Choice: Bounded repair
+
+Repairs have a hard attempt limit.
+
+### Why
+
+An unconstrained agent loop can spend unlimited time repeatedly modifying a composition without converging.
+
+A cap gives predictable failure behavior.
+
+### Rejected alternative
+
+Retry indefinitely until the check passes.
+
+This violates the requirement to fail loudly when the system cannot repair itself and can hide systematic problems.
+
+---
+
+# 10. What I Would Not Have Time to Build
+
+Given the available development window, I prioritized the core architecture and verification mechanism over secondary features.
+
+The following were intentionally not prioritized:
+
+### Advanced visual templates
+
+A large library of highly polished templates could improve visual variety, but it would not demonstrate the central engineering requirement of automatic planning, verification and repair.
+
+### Audio generation
+
+Voiceover, music generation and audio mixing were not necessary to prove the core brief-to-video pipeline.
+
+### Web UI
+
+A browser-based front end would improve usability, but the CLI already demonstrates the required automation path and leaves more time for the core pipeline.
+
+### Cloud rendering
+
+Local HyperFrames rendering was sufficient for the assignment. Cloud deployment would add operational complexity without improving the core demonstration.
+
+### Large-scale asset caching
+
+A more sophisticated content-addressed asset cache could reduce repeated image-generation costs, but it was not essential to demonstrate the architecture.
+
+The principle was:
+
+> Build the smallest system that demonstrates the important engineering property rather than spending the available time on peripheral polish.
+
+---
+
+# 11. Current Implementation Status
+
+The core pipeline was implemented and tested against the first brief.
+
+The following stages were successfully demonstrated:
+
+```text
+Brief ingestion                    ✓
+GPT-5.5 planning                   ✓
+Structured plan artifact           ✓
+gpt-image-2 asset generation       ✓
+HyperFrames composition            ✓
+HyperFrames check                  ✓
+HyperFrames check: "ok": true     ✓
+Browser frame capture              ✓
+360 / 360 frames captured         ✓
+Encoding/assembly                  ✓
+Artifact validation                ✓
+Final Python MP4 handoff           ✗
+Brief 2                             Not completed
+Brief 3                             Not completed
+```
+
+The successful HyperFrames verification result is important:
+
+```json
+{
+  "ok": true
+}
+```
+
+The render log also reached:
+
+```text
+framesCompleted: 360
+```
+
+followed by:
+
+```text
+artifact validated
+```
+
+---
+
+# 12. Remaining Render-Wrapper Issue
+
+The remaining issue is not the HyperFrames composition validation itself.
+
+The first brief successfully passed the HyperFrames check and the HyperFrames render pipeline progressed through frame capture, encoding, assembly and artifact validation.
+
+The failure occurs in the Python wrapper after HyperFrames finishes.
+
+The CLI currently reports:
+
+```text
+FAILED after 1 attempt(s):
+hyperframes render exited non-zero or produced no file
+```
+
+The available render trace shows that HyperFrames captured all 360 frames and reached artifact validation, so the evidence indicates that the underlying rendering process completed its main work.
+
+The likely issue is an output-path mismatch between the path supplied by the Python wrapper and the path HyperFrames uses relative to its project working directory.
+
+The generated output directory shows nested output paths, indicating that a relative output path is being interpreted from the HyperFrames project directory rather than from the original CLI working directory.
+
+Conceptually, the problem is:
+
+```text
+Python expected:
+
+out/brief1/<hash>/render/video.mp4
+
+but HyperFrames was invoked from:
+
+out/brief1/<hash>/
+
+with a relative output path that caused an additional:
+
+out/brief1/<hash>/
+
+to be introduced.
+```
+
+As a result, HyperFrames can complete the render while the Python wrapper fails to locate the expected MP4 and reports the overall operation as unsuccessful.
+
+This is deliberately treated as a failure rather than being hidden.
+
+The correct fix would be to make the render output path unambiguous, preferably by resolving the output path to an absolute path before invoking HyperFrames, or by using a project-relative output path and then checking that exact location.
+
+---
+
+# 13. Briefs 2 and 3
+
+Briefs 2 and 3 were defined and included in the repository, but they were not completed within the available development window.
+
+This is intentional rather than a claim of completion.
+
+The first priority was to establish that the fundamental architecture worked against a real HyperFrames browser/rendering environment.
+
+Brief 1 reached the verification and actual rendering stages, exposing the remaining wrapper-level issue.
+
+Completing the other two briefs before resolving the first end-to-end path would have increased the number of unverified failure points.
+
+Therefore, the decision was to stop rather than produce three superficially generated outputs without reliable verification.
+
+---
+
+# 14. Final Engineering Position
+
+The main engineering objective was to demonstrate a system that does not blindly trust generated video compositions.
+
+The architecture therefore treats:
+
+```text
+generation ≠ success
+```
+
+Instead:
+
+```text
+generation
+    ↓
+verification
+    ↓
+repair if necessary
+    ↓
+verification again
+    ↓
+render
+    ↓
+artifact confirmation
+    ↓
+success
+```
+
+This makes the system fail closed.
+
+The current implementation demonstrates the majority of this pipeline, including a successful HyperFrames verification and a complete underlying capture/encoding pass for Brief 1.
+
+The remaining work is primarily finishing the render-wrapper artifact handoff and then running the same pipeline against Briefs 2 and 3.
